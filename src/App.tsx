@@ -18,6 +18,10 @@ import {
 	HeadphonesIcon
 } from "./icons";
 import { CompactMediaPlayer } from "./CompactMediaPlayer";
+import { CodexIsland } from "./components/CodexIsland";
+import { useCodexSessions } from "./hooks/useCodexSessions";
+import { AntigravityIsland } from "./components/AntigravityIsland";
+import { useAntigravitySessions } from "./hooks/useAntigravitySessions";
 import { useWeather } from "./hooks/useWeather";
 import { useSettingsSync } from "./hooks/useSettingsSync";
 import { useTrailingThrottle } from "./hooks/useTrailingThrottle";
@@ -627,7 +631,7 @@ function App() {
 	const isAnyInteraction = isHovered || isNotchHovered || isEdgeHovered;
 	const isHidden =
 		!startupAnimating &&
-		((notchMode === "smart" && isOverlapped && interactionState === "none") ||
+		((notchMode === "smart" && isOverlapped && interactionState === "none" && !eventPeek) ||
 			(notchMode === "peek" && interactionState === "none" && !eventPeek));
 
 	useEffect(() => {
@@ -1039,10 +1043,70 @@ function App() {
 		invoke("change_notch_mode", { mode: notchMode });
 	}, [notchMode, windowLabel]);
 
-	// Bloom mode state: 'music', 'calendar', 'command-center', 'announcement', or 'status'
+	// AI agent sessions (Antigravity & Codex) join notch modes
+	const codex = useCodexSessions();
+	const antigravity = useAntigravitySessions();
 	const [bloomMode, setBloomMode] = useState<
-		"music" | "calendar" | "command-center" | "announcement" | "status"
+		"music" | "calendar" | "command-center" | "announcement" | "status" | "codex" | "antigravity"
 	>("status");
+
+	const codexPreviousStates = useRef(new Map<string, string>());
+	useEffect(() => {
+		const previous = codexPreviousStates.current;
+		const approval = codex.sessions.find(
+			(s) => s.status === "awaiting_approval" && previous.get(s.id) !== s.status
+		);
+		const started = codex.sessions.find(
+			(s) => s.status === "running" && previous.get(s.id) !== s.status
+		);
+		const finished = codex.sessions.some(
+			(s) => s.status === "completed" && previous.get(s.id) === "running"
+		);
+		codexPreviousStates.current = new Map(codex.sessions.map((s) => [s.id, s.status]));
+		if (approval) {
+			codex.select(approval.id);
+			setBloomMode("codex");
+			triggerEventPeek(8000);
+		} else if (started && !announcementOpenRef.current && bloomMode === "status") {
+			setBloomMode("codex");
+			triggerEventPeek(4000);
+		} else if (finished && bloomMode === "codex") {
+			triggerEventPeek(5000);
+		}
+	}, [codex.sessions, codex.select, bloomMode, triggerEventPeek]);
+	useEffect(() => {
+		if (!codex.enabled && bloomMode === "codex") setBloomMode("status");
+	}, [codex.enabled, bloomMode]);
+
+	const antigravityPreviousStates = useRef(new Map<string, string>());
+	useEffect(() => {
+		const previous = antigravityPreviousStates.current;
+		const approval = antigravity.sessions.find(
+			(s) => s.status === "awaiting_approval" && previous.get(s.id) !== s.status
+		);
+		const started = antigravity.sessions.find(
+			(s) => s.status === "running" && previous.get(s.id) !== s.status
+		);
+		const finished = antigravity.sessions.some(
+			(s) => s.status === "completed" && previous.get(s.id) === "running"
+		);
+		antigravityPreviousStates.current = new Map(
+			antigravity.sessions.map((s) => [s.id, s.status])
+		);
+		if (approval) {
+			antigravity.select(approval.id);
+			setBloomMode("antigravity");
+			triggerEventPeek(8000);
+		} else if (started && !announcementOpenRef.current && bloomMode === "status") {
+			setBloomMode("antigravity");
+			triggerEventPeek(4000);
+		} else if (finished && bloomMode === "antigravity") {
+			triggerEventPeek(5000);
+		}
+	}, [antigravity.sessions, antigravity.select, bloomMode, triggerEventPeek]);
+	useEffect(() => {
+		if (!antigravity.enabled && bloomMode === "antigravity") setBloomMode("status");
+	}, [antigravity.enabled, bloomMode]);
 
 	// Open the notch on an unseen announcement; stays open until dismissed.
 	useEffect(() => {
@@ -1065,7 +1129,12 @@ function App() {
 	const lastScrollTime = useRef(0);
 	const handleWheel = (e: React.WheelEvent) => {
 		const target = e.target as HTMLElement;
-		if (target.closest(".calendar-grid") || target.closest(".timer-column")) {
+		if (
+			target.closest(".calendar-grid") ||
+			target.closest(".timer-column") ||
+			target.closest(".codex-island") ||
+			target.closest(".antigravity-island")
+		) {
 			return;
 		}
 
@@ -1082,12 +1151,21 @@ function App() {
 		// Playing: command-center → music → status → calendar (active, near command-center)
 		// Paused:  command-center → status → music → calendar (secondary, after status)
 		const musicBeforeStatus = isPlaying && mediaInfo.has_media && settingsMusicModeEnabled;
-		const modes: ("command-center" | "status" | "music" | "calendar")[] = musicBeforeStatus
-			? ["command-center", "music", "status", "calendar"]
-			: ["command-center", "status", "music", "calendar"];
+		const modes: (
+			| "command-center"
+			| "status"
+			| "music"
+			| "calendar"
+			| "antigravity"
+			| "codex"
+		)[] = musicBeforeStatus
+			? ["command-center", "music", "status", "antigravity", "codex", "calendar"]
+			: ["command-center", "status", "antigravity", "codex", "music", "calendar"];
 		const availableModes = modes.filter((m) => {
 			if (m === "music" && (!settingsMusicModeEnabled || !mediaInfo.has_media)) return false;
 			if (m === "calendar" && !settingsCalendarEnabled) return false;
+			if (m === "codex" && !codex.enabled) return false;
+			if (m === "antigravity" && !antigravity.enabled) return false;
 			return true;
 		});
 
@@ -1292,6 +1370,8 @@ function App() {
 			mediaInfo.has_media &&
 			isPlaying &&
 			bloomMode !== "calendar" &&
+			bloomMode !== "codex" &&
+			bloomMode !== "antigravity" &&
 			!announcementOpenRef.current &&
 			(isNewTrackWhilePlaying || justStartedPlaying)
 		) {
@@ -1863,6 +1943,8 @@ function App() {
 
 	// Calculate width dynamically based on enabled features
 	const getDynamicWidth = () => {
+		if (bloomMode === "antigravity") return isHovered ? 390 : 290;
+		if (bloomMode === "codex") return isHovered ? 380 : 290;
 		if (bloomMode === "announcement" && announcement && !announcementDismissed) return 380;
 		if (isCalendarMode) return 480;
 		if (bloomMode === "command-center" && isHovered) return 350;
@@ -1891,6 +1973,8 @@ function App() {
 		if (!isExpanded || !isVisible || isHidden) {
 			return isImpacted ? 28.9 : 44.2;
 		}
+		if (bloomMode === "antigravity") return isHovered ? 306 : 36;
+		if (bloomMode === "codex") return isHovered ? 306 : 36;
 		// Announcement card: body is line-clamped, so a fixed size fits both cases.
 		if (bloomMode === "announcement" && announcement && !announcementDismissed) {
 			return announcement.url ? 168 : 148;
@@ -1985,7 +2069,11 @@ function App() {
 					}}
 					onHoverStart={() => {
 						setIsHovered(true);
-						if (bloomMode !== "announcement") {
+						if (
+							bloomMode !== "announcement" &&
+							bloomMode !== "codex" &&
+							bloomMode !== "antigravity"
+						) {
 							setBloomMode(mediaInfo.has_media && isPlaying ? "music" : "status");
 						}
 					}}
@@ -2064,7 +2152,49 @@ function App() {
 							>
 								{/* Faster Waiting Transition Area */}
 								<AnimatePresence mode="wait">
-									{isHovered && isMusicMode && !isCalendarMode ? (
+									{bloomMode === "antigravity" ? (
+										<motion.div
+											key="antigravity-view"
+											initial={{ opacity: 0 }}
+											animate={{ opacity: 1 }}
+											exit={{ opacity: 0 }}
+											style={{ width: "100%", height: "100%" }}
+										>
+											<AntigravityIsland
+												expanded={isHovered}
+												sessions={antigravity.sessions}
+												selected={antigravity.selected}
+												select={antigravity.select}
+												sourceFilter={antigravity.sourceFilter}
+												setSourceFilter={antigravity.setSourceFilter}
+												installed={antigravity.snapshot.installed}
+												loading={antigravity.loading}
+												error={antigravity.error}
+												refresh={antigravity.refresh}
+												close={() => setBloomMode("status")}
+											/>
+										</motion.div>
+									) : bloomMode === "codex" ? (
+										<motion.div
+											key="codex-view"
+											initial={{ opacity: 0 }}
+											animate={{ opacity: 1 }}
+											exit={{ opacity: 0 }}
+											style={{ width: "100%", height: "100%" }}
+										>
+											<CodexIsland
+												expanded={isHovered}
+												sessions={codex.sessions}
+												selected={codex.selected}
+												select={codex.select}
+												installed={codex.snapshot.installed}
+												loading={codex.loading}
+												error={codex.error}
+												refresh={codex.refresh}
+												close={() => setBloomMode("status")}
+											/>
+										</motion.div>
+									) : isHovered && isMusicMode && !isCalendarMode ? (
 										<motion.div
 											key="expanded-music"
 											className="expanded-music-container"

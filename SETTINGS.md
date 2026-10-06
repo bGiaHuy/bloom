@@ -56,6 +56,45 @@ Edit `settings.json` with any text editor while Bloom is running. Changes are ap
 | `bloom-music-mode-enabled`  | `"true"` / `"false"` | `"true"` | Enable interactive music media widget.                                |
 | `bloom-music-compact-notch` | `"true"` / `"false"` | `"true"` | Show compact music display (visualizer + artwork) in collapsed notch. |
 
+### Antigravity
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bloom-antigravity-enabled` | `"true"` / `"false"` | `"true"` | Show the Antigravity notch mode and reveal real-time task activity & approval requests from Antigravity IDE and Antigravity 2.0. |
+
+Antigravity monitors real-time conversation state and tool executions across
+`%USERPROFILE%/.gemini/antigravity-ide` and `%USERPROFILE%/.gemini/antigravity`.
+Unlike hook-based systems, it requires zero configuration or file modifications.
+When an agent is running tools, the island indicates active tasks in real-time.
+When an agent calls `ask_question` or requests permission, the island highlights
+a prominent amber **Needs Allow** badge and provides a **Review in Antigravity**
+button to jump directly to the session.
+
+### Codex
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bloom-codex-enabled` | `"true"` / `"false"` | `"true"` | Show the Codex notch mode and reveal local task/approval activity. Connect separately in Notch settings. |
+
+The Connect button adds informational lifecycle hooks to `%CODEX_HOME%/hooks.json`
+(default `%USERPROFILE%/.codex/hooks.json`), preserving existing hooks and saving a
+backup. Review/trust the new hooks in Codex and start or resume a local chat.
+Disconnect removes only Bloom's hooks. Turning the display off hides the mode;
+Disconnect also stops status reporting. Local Work is supported where lifecycle
+hooks are available; cloud chats are not monitored.
+
+Status files in `%APPDATA%/bloom/codex/` contain session IDs, project paths, tool
+names, approval descriptions and timestamps. Prompts, tool arguments, responses,
+and credentials are not copied. Recent titles are read best-effort from Codex's
+local session index, with a project/ID fallback. Hooks do not heartbeat: after
+15 minutes without an event, active states show "No recent signal". Finished
+sessions remain selectable for seven days (up to 24 recent sessions).
+
+An approval request reveals the Codex mode and offers **Review in Codex**. The
+island never returns approval decisions. Scroll over other notch modes to reach
+Codex; scroll inside the Codex panel to browse chats. Close the panel to return
+to status.
+
 ### Music Appearance
 
 | Key                                | Type                      | Default     | Description                                                                                     |
