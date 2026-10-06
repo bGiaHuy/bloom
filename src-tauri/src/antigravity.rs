@@ -1,6 +1,7 @@
-//! Antigravity IDE and Antigravity 2.0 lifecycle tracking and Notch integration.
+//! Antigravity IDE and Antigravity 2.0 lifecycle tracking, Notch integration and prompt dispatch.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ pub struct AntigravitySession {
     pub detail: String,
     pub updated_at: u64,
     pub source: String, // "IDE" | "Antigravity 2.0"
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,24 @@ fn is_antigravity_installed() -> (bool, bool) {
     (ide, app)
 }
 
+fn load_known_projects() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some(root) = gemini_root() else { return map; };
+    let projects_file = root.join("projects.json");
+    if let Ok(bytes) = std::fs::read(projects_file) {
+        if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(obj) = val["projects"].as_object() {
+                for (path, name) in obj {
+                    if let Some(name_str) = name.as_str() {
+                        map.insert(name_str.to_lowercase(), path.clone());
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
 fn clipped(value: &str, length: usize) -> String {
     value
         .chars()
@@ -49,7 +69,12 @@ fn clipped(value: &str, length: usize) -> String {
         .collect()
 }
 
-fn parse_transcript_file(path: &Path, source_name: &str, now: u64) -> Option<AntigravitySession> {
+fn parse_transcript_file(
+    path: &Path,
+    source_name: &str,
+    now: u64,
+    known_projects: &HashMap<String, String>,
+) -> Option<AntigravitySession> {
     let Ok(mut file) = File::open(path) else {
         return None;
     };
@@ -101,14 +126,37 @@ fn parse_transcript_file(path: &Path, source_name: &str, now: u64) -> Option<Ant
         }
     }
 
-    // Extract project from head
+    // Extract project and workspace path from head
     let mut project = String::new();
+    let mut workspace_path = None;
+
     for part in head_str.split(&['\\', '/'][..]) {
         if let Some(rest) = part.strip_prefix("Codespace") {
             let p = rest.trim_start_matches(['\\', '/']).trim();
             if !p.is_empty() && p.len() < 50 {
                 project = clipped(p, 40);
                 break;
+            }
+        }
+    }
+
+    if !project.is_empty() {
+        if let Some(known_path) = known_projects.get(&project.to_lowercase()) {
+            workspace_path = Some(known_path.clone());
+        }
+    }
+
+    // If not found in known projects, try searching for full path pattern
+    if workspace_path.is_none() {
+        for line in head_str.lines() {
+            if let Some(idx) = line.find("Codespace") {
+                let prefix_start = line[..idx].rfind(|c: char| c == '"' || c == '\'' || c == ' ' || c == '<' || c == '(').map(|i| i + 1).unwrap_or(0);
+                let suffix_end = line[idx..].find(|c: char| c == '"' || c == '\'' || c == '\n' || c == '\r' || c == '>' || c == ')').map(|i| idx + i).unwrap_or(line.len());
+                let candidate = line[prefix_start..suffix_end].replace("\\\\", "\\").trim().to_string();
+                if candidate.contains(':') && Path::new(&candidate).is_dir() {
+                    workspace_path = Some(candidate);
+                    break;
+                }
             }
         }
     }
@@ -230,6 +278,7 @@ fn parse_transcript_file(path: &Path, source_name: &str, now: u64) -> Option<Ant
         detail,
         updated_at: mtime,
         source: source_name.to_string(),
+        workspace_path,
     })
 }
 
@@ -250,6 +299,8 @@ fn read_snapshot() -> Result<AntigravitySnapshot, String> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+
+    let known_projects = load_known_projects();
 
     let sources = [
         ("IDE", root.join("antigravity-ide").join("brain")),
@@ -287,7 +338,7 @@ fn read_snapshot() -> Result<AntigravitySnapshot, String> {
 
     let mut sessions = Vec::new();
     for (_, path, source_name) in candidate_files {
-        if let Some(session) = parse_transcript_file(&path, source_name, now) {
+        if let Some(session) = parse_transcript_file(&path, source_name, now, &known_projects) {
             sessions.push(session);
         }
     }
@@ -411,4 +462,80 @@ pub fn focus_antigravity() -> Result<(), String> {
     } else {
         Err("Antigravity window not found.".into())
     }
+}
+
+#[tauri::command]
+pub async fn send_antigravity_prompt(
+    prompt: String,
+    session_id: Option<String>,
+    workspace_path: Option<String>,
+    source: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let clean_prompt = prompt.trim();
+        if clean_prompt.is_empty() {
+            return Err("Prompt cannot be empty.".into());
+        }
+
+        let cwd = workspace_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let is_app_source = source
+            .as_deref()
+            .map(|s| s.contains("2.0") || s.contains("App"))
+            .unwrap_or(false);
+
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        if is_app_source {
+            let agy_path = std::env::var_os("LOCALAPPDATA")
+                .map(|p| PathBuf::from(p).join("agy").join("bin").join("agy.exe"))
+                .filter(|p| p.is_file());
+
+            if let Some(agy) = agy_path {
+                let mut cmd = std::process::Command::new(agy);
+                if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+                    cmd.args(["--conversation", &sid, "-p", clean_prompt]);
+                } else {
+                    cmd.args(["-p", clean_prompt]);
+                }
+                cmd.current_dir(&cwd);
+                cmd.creation_flags(CREATE_NO_WINDOW);
+                cmd.spawn()
+                    .map_err(|e| format!("Failed to launch agy: {e}"))?;
+                return Ok("Prompt sent to Antigravity 2.0".into());
+            }
+        }
+
+        let ide_cmd = std::env::var_os("LOCALAPPDATA")
+            .map(|p| {
+                PathBuf::from(p)
+                    .join("Programs")
+                    .join("Antigravity IDE")
+                    .join("bin")
+                    .join("antigravity-ide.cmd")
+            })
+            .filter(|p| p.is_file());
+
+        if let Some(cmd_path) = ide_cmd {
+            let mut cmd = std::process::Command::new("cmd.exe");
+            cmd.args(["/C", &cmd_path.to_string_lossy(), "chat", "-r", clean_prompt]);
+            cmd.current_dir(&cwd);
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.spawn()
+                .map_err(|e| format!("Failed to send chat to Antigravity IDE: {e}"))?;
+
+            focus_antigravity_window();
+            return Ok("Prompt sent to Antigravity IDE".into());
+        }
+
+        Err("Antigravity executable not found.".into())
+    })
+    .await
+    .map_err(|e| format!("Task failed: {e}"))?
 }

@@ -95,9 +95,12 @@ fn main() {
             codex::get_codex_sessions,
             codex::configure_codex_bridge,
             codex::open_codex_chat,
+            codex::respond_codex_approval,
+            codex::get_codex_rate_limits,
             antigravity::get_antigravity_sessions,
             antigravity::open_antigravity_chat,
             antigravity::focus_antigravity,
+            antigravity::send_antigravity_prompt,
             hide_native_osd,
             open_settings_window,
             open_wifi_settings,
@@ -184,6 +187,7 @@ fn main() {
             // invoke save_setting as soon as it loads, which happens before the
             // rest of this hook runs.
             crate::utils::init_settings_cache(app.handle());
+            codex::start_status_service(app.handle().clone());
             // Crash-recovery: if a previous session was force-killed while the native
             // taskbar was hidden, restore it now. Runs before the frontend re-hides it
             // (init_dock fires after a delay), so the flag must be removed first.

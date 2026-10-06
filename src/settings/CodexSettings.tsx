@@ -65,7 +65,7 @@ export function CodexSettings() {
 				<SettingRow
 					icon={Terminal}
 					label={codex.snapshot.installed ? "Codex connected" : "Connect Codex"}
-					desc="Adds a status hook; existing hooks are preserved. Review approvals in Codex."
+					desc="Usage limits and Allow once on the island. Existing hooks are preserved."
 					divider={false}
 				>
 					<button

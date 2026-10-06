@@ -460,6 +460,10 @@ function App() {
 	const lowBatteryPulseShownRef = useRef<boolean>(false);
 
 	const [eventPeek, setEventPeek] = useState(false);
+	const codex = useCodexSessions();
+	const codexNeedsAttention = codex.sessions.some(s => s.status === "awaiting_approval");
+	const antigravity = useAntigravitySessions();
+	const antigravityNeedsAttention = antigravity.sessions.some(s => s.status === "awaiting_approval");
 	const eventPeekTimeoutRef = useRef<any>(null);
 	const updatePulseTimerRef = useRef<any>(null);
 	const triggerEventPeek = useCallback((duration = 3000) => {
@@ -630,6 +634,8 @@ function App() {
 
 	const isAnyInteraction = isHovered || isNotchHovered || isEdgeHovered;
 	const isHidden =
+		!codexNeedsAttention &&
+		!antigravityNeedsAttention &&
 		!startupAnimating &&
 		((notchMode === "smart" && isOverlapped && interactionState === "none" && !eventPeek) ||
 			(notchMode === "peek" && interactionState === "none" && !eventPeek));
@@ -1044,8 +1050,6 @@ function App() {
 	}, [notchMode, windowLabel]);
 
 	// AI agent sessions (Antigravity & Codex) join notch modes
-	const codex = useCodexSessions();
-	const antigravity = useAntigravitySessions();
 	const [bloomMode, setBloomMode] = useState<
 		"music" | "calendar" | "command-center" | "announcement" | "status" | "codex" | "antigravity"
 	>("status");
@@ -1059,8 +1063,8 @@ function App() {
 		const started = codex.sessions.find(
 			(s) => s.status === "running" && previous.get(s.id) !== s.status
 		);
-		const finished = codex.sessions.some(
-			(s) => s.status === "completed" && previous.get(s.id) === "running"
+		const finished = codex.sessions.find(
+			(s) => s.status === "completed" && ["running", "awaiting_approval"].includes(previous.get(s.id) ?? "")
 		);
 		codexPreviousStates.current = new Map(codex.sessions.map((s) => [s.id, s.status]));
 		if (approval) {
@@ -1070,10 +1074,19 @@ function App() {
 		} else if (started && !announcementOpenRef.current && bloomMode === "status") {
 			setBloomMode("codex");
 			triggerEventPeek(4000);
-		} else if (finished && bloomMode === "codex") {
-			triggerEventPeek(5000);
+		} else if (finished && !codexNeedsAttention) {
+			setIsVisible(true);
+			codex.select(finished.id);
+			setBloomMode("codex");
+			triggerEventPeek(6000);
 		}
-	}, [codex.sessions, codex.select, bloomMode, triggerEventPeek]);
+	}, [codex.sessions, codex.select, bloomMode, triggerEventPeek, codexNeedsAttention]);
+	useEffect(() => {
+		if (codexNeedsAttention) {
+			setIsVisible(true);
+			setBloomMode("codex");
+		}
+	}, [codexNeedsAttention, bloomMode, isVisible]);
 	useEffect(() => {
 		if (!codex.enabled && bloomMode === "codex") setBloomMode("status");
 	}, [codex.enabled, bloomMode]);
@@ -1087,8 +1100,8 @@ function App() {
 		const started = antigravity.sessions.find(
 			(s) => s.status === "running" && previous.get(s.id) !== s.status
 		);
-		const finished = antigravity.sessions.some(
-			(s) => s.status === "completed" && previous.get(s.id) === "running"
+		const finished = antigravity.sessions.find(
+			(s) => s.status === "completed" && ["running", "awaiting_approval"].includes(previous.get(s.id) ?? "")
 		);
 		antigravityPreviousStates.current = new Map(
 			antigravity.sessions.map((s) => [s.id, s.status])
@@ -1100,10 +1113,19 @@ function App() {
 		} else if (started && !announcementOpenRef.current && bloomMode === "status") {
 			setBloomMode("antigravity");
 			triggerEventPeek(4000);
-		} else if (finished && bloomMode === "antigravity") {
-			triggerEventPeek(5000);
+		} else if (finished && !antigravityNeedsAttention) {
+			setIsVisible(true);
+			antigravity.select(finished.id);
+			setBloomMode("antigravity");
+			triggerEventPeek(6000);
 		}
-	}, [antigravity.sessions, antigravity.select, bloomMode, triggerEventPeek]);
+	}, [antigravity.sessions, antigravity.select, bloomMode, triggerEventPeek, antigravityNeedsAttention]);
+	useEffect(() => {
+		if (antigravityNeedsAttention) {
+			setIsVisible(true);
+			setBloomMode("antigravity");
+		}
+	}, [antigravityNeedsAttention, bloomMode, isVisible]);
 	useEffect(() => {
 		if (!antigravity.enabled && bloomMode === "antigravity") setBloomMode("status");
 	}, [antigravity.enabled, bloomMode]);
@@ -1943,8 +1965,8 @@ function App() {
 
 	// Calculate width dynamically based on enabled features
 	const getDynamicWidth = () => {
-		if (bloomMode === "antigravity") return isHovered ? 390 : 290;
-		if (bloomMode === "codex") return isHovered ? 380 : 290;
+		if (bloomMode === "antigravity") return isHovered || antigravityNeedsAttention ? 440 : 290;
+		if (bloomMode === "codex") return isHovered || codexNeedsAttention ? 440 : 290;
 		if (bloomMode === "announcement" && announcement && !announcementDismissed) return 380;
 		if (isCalendarMode) return 480;
 		if (bloomMode === "command-center" && isHovered) return 350;
@@ -1973,8 +1995,8 @@ function App() {
 		if (!isExpanded || !isVisible || isHidden) {
 			return isImpacted ? 28.9 : 44.2;
 		}
-		if (bloomMode === "antigravity") return isHovered ? 306 : 36;
-		if (bloomMode === "codex") return isHovered ? 306 : 36;
+		if (bloomMode === "antigravity") return isHovered || antigravityNeedsAttention ? 380 : 36;
+		if (bloomMode === "codex") return isHovered || codexNeedsAttention ? 380 : 36;
 		// Announcement card: body is line-clamped, so a fixed size fits both cases.
 		if (bloomMode === "announcement" && announcement && !announcementDismissed) {
 			return announcement.url ? 168 : 148;
@@ -2001,7 +2023,7 @@ function App() {
 		if (mediaLayout === "compact") {
 			setCompactVolumeExpanded(false);
 		}
-	}, [isHovered, mediaLayout, bloomMode]);
+	}, [isHovered, mediaLayout, bloomMode, codexNeedsAttention, antigravityNeedsAttention]);
 
 	return (
 		<div className="screen" style={{ overflow: "hidden" }}>
@@ -2161,7 +2183,7 @@ function App() {
 											style={{ width: "100%", height: "100%" }}
 										>
 											<AntigravityIsland
-												expanded={isHovered}
+												expanded={isHovered || antigravityNeedsAttention}
 												sessions={antigravity.sessions}
 												selected={antigravity.selected}
 												select={antigravity.select}
@@ -2171,6 +2193,7 @@ function App() {
 												loading={antigravity.loading}
 												error={antigravity.error}
 												refresh={antigravity.refresh}
+												sendPrompt={antigravity.sendPrompt}
 												close={() => setBloomMode("status")}
 											/>
 										</motion.div>
@@ -2183,7 +2206,7 @@ function App() {
 											style={{ width: "100%", height: "100%" }}
 										>
 											<CodexIsland
-												expanded={isHovered}
+												expanded={isHovered || codexNeedsAttention}
 												sessions={codex.sessions}
 												selected={codex.selected}
 												select={codex.select}
@@ -2191,6 +2214,8 @@ function App() {
 												loading={codex.loading}
 												error={codex.error}
 												refresh={codex.refresh}
+												rateLimits={codex.rateLimits}
+												rateError={codex.rateError}
 												close={() => setBloomMode("status")}
 											/>
 										</motion.div>

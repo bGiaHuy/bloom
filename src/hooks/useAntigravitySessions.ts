@@ -17,6 +17,7 @@ export interface AntigravitySession {
 	detail: string;
 	updatedAt: number;
 	source: "IDE" | "Antigravity 2.0" | string;
+	workspacePath?: string | null;
 }
 
 export interface AntigravitySnapshot {
@@ -97,6 +98,25 @@ export function useAntigravitySessions() {
 		};
 	}, [enabled]);
 
+	const sendPrompt = useCallback(
+		async (
+			prompt: string,
+			sessionId?: string | null,
+			workspacePath?: string | null,
+			source?: string | null
+		) => {
+			const res = await invoke<string>("send_antigravity_prompt", {
+				prompt,
+				sessionId: sessionId ?? null,
+				workspacePath: workspacePath ?? null,
+				source: source ?? null
+			});
+			await refresh();
+			return res;
+		},
+		[refresh]
+	);
+
 	const allSessions = enabled ? snapshot.sessions : [];
 	const filteredSessions =
 		sourceFilter === "all"
@@ -115,6 +135,7 @@ export function useAntigravitySessions() {
 		select: setSelectedId,
 		sourceFilter,
 		setSourceFilter,
+		sendPrompt,
 		error,
 		loading,
 		refresh

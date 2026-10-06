@@ -9,7 +9,7 @@ import {
 	X
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import type { CodexSession, CodexStatus } from "../hooks/useCodexSessions";
+import type { CodexSession, CodexStatus, CodexRateLimits, CodexRateWindow } from "../hooks/useCodexSessions";
 import "./CodexIsland.css";
 
 const labels: Record<CodexStatus, string> = {
@@ -27,6 +27,25 @@ function StatusIcon({ status }: { status: CodexStatus }) {
 	if (status === "completed") return <Check size={14} />;
 	return <span className="codex-status-dot" />;
 }
+function Usage({ limits, error }: { limits: CodexRateLimits | null; error: string }) {
+	const buckets = limits?.rateLimitsByLimitId ? Object.values(limits.rateLimitsByLimitId) : limits?.rateLimits ? [limits.rateLimits] : [];
+	const window = (value: CodexRateWindow, name: string) => {
+		const remaining = Math.max(0, Math.min(100, 100 - value.usedPercent));
+		return <div className="codex-quota" key={name}>
+			<div className="codex-quota-ring" role="meter" aria-label={`${name} remaining`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={remaining} aria-valuetext={`${Math.round(remaining)}% left`}>
+				<svg viewBox="0 0 44 44" aria-hidden="true">
+					<circle className="codex-quota-ring-track" cx="22" cy="22" r="18" />
+					<circle className="codex-quota-ring-value" cx="22" cy="22" r="18" pathLength="100" strokeDasharray={`${remaining} 100`} />
+				</svg>
+				<strong aria-hidden="true">{Math.round(remaining)}%</strong>
+			</div>
+			<div className="codex-quota-info"><span>{name}</span><small>{value.resetsAt ? `Resets ${new Date(value.resetsAt * 1000).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}` : "Reset time unavailable"}</small></div>
+		</div>;
+	};
+	return <div className="codex-usage" aria-label="Codex usage limits">
+		{buckets.length ? buckets.map(bucket => <div key={bucket.limitId} className="codex-quota-bucket"><span className="codex-quota-name">{bucket.limitName || bucket.limitId}</span><div className="codex-quota-windows">{[bucket.primary, bucket.secondary].map((w, i) => w ? window(w, w.windowDurationMins ? w.windowDurationMins >= 1440 ? `${Math.round(w.windowDurationMins / 1440)} days` : `${Math.round(w.windowDurationMins / 60 * 10) / 10} hours` : i ? "Long window" : "Short window") : null)}</div></div>) : <small>{error || "Reading usage…"}</small>}
+	</div>;
+}
 
 export function CodexIsland({
 	expanded,
@@ -37,6 +56,8 @@ export function CodexIsland({
 	loading,
 	error,
 	refresh,
+	rateLimits,
+	rateError,
 	close
 }: {
 	expanded: boolean;
@@ -47,6 +68,8 @@ export function CodexIsland({
 	loading: boolean;
 	error: string;
 	refresh: () => Promise<void>;
+	rateLimits: CodexRateLimits | null;
+	rateError: string;
 	close: () => void;
 }) {
 	const [busy, setBusy] = useState(false);
@@ -54,6 +77,14 @@ export function CodexIsland({
 	const running = sessions.filter((s) => s.status === "running").length;
 	const approvals = sessions.filter((s) => s.status === "awaiting_approval");
 	const pending = selected?.status === "awaiting_approval";
+	const approval = selected?.approval;
+	const decide = async (decision: "allow" | "deny") => {
+		if (!selected || !approval || busy) return;
+		setBusy(true); setActionError("");
+		try { await invoke("respond_codex_approval", { id: selected.id, requestId: approval.requestId, decision }); await refresh(); }
+		catch (e) { setActionError(String(e)); }
+		finally { setBusy(false); }
+	};
 	const open = async () => {
 		if (!selected || busy) return;
 		setBusy(true);
@@ -115,6 +146,7 @@ export function CodexIsland({
 					<X size={14} />
 				</button>
 			</header>
+			<Usage limits={rateLimits} error={rateError} />
 			{sessions.length > 0 && selected ? (
 				<>
 					<div className="codex-session-list" aria-label="Choose a chat">
@@ -149,6 +181,7 @@ export function CodexIsland({
 							</time>
 						</div>
 						<p title={selected.detail}>{selected.detail || "Open Codex to view this chat."}</p>
+						{pending && approval && <div className="codex-permission-review"><span>{approval.tool} · Allow once</span><pre>{approval.command}</pre><div><button className="codex-open-button" disabled={busy} onClick={() => { void decide("deny"); }}>Deny</button><button className="codex-approval-button" disabled={busy} onClick={() => { void decide("allow"); }}>{busy ? "Sending…" : "Allow once"}</button></div></div>}
 						<div className="codex-detail-footer">
 							<span title={selected.project}>{selected.project || "Local session"}</span>
 							<button
@@ -156,9 +189,9 @@ export function CodexIsland({
 									void open();
 								}}
 								disabled={busy}
-								className={pending ? "codex-approval-button" : "codex-open-button"}
+								className={pending && !approval ? "codex-approval-button" : "codex-open-button"}
 							>
-								{busy ? "Opening…" : pending ? "Review in Codex" : "Open chat"}
+								{busy ? "Opening…" : pending && !approval ? "Review in Codex" : "Open chat"}
 								<ExternalLink size={12} />
 							</button>
 						</div>

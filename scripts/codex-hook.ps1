@@ -1,11 +1,12 @@
 param(
     [switch]$Install,
     [switch]$Uninstall,
+	[int]$ApprovalWaitSeconds = 120,
     [string]$StateRoot = (Join-Path $env:APPDATA 'bloom\codex'),
     [string]$CodexRoot = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' })
 )
 
-# Informational only: never emit a permission decision or change tool input.
+# Permission decisions are returned only after an explicit response from Bloom's UI.
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
 $events = @('SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse', 'PermissionRequest', 'PostToolUse', 'Stop', 'Interrupt')
@@ -58,7 +59,7 @@ if ($Install -or $Uninstall) {
                 }
             }
         }
-        if ($Install) { $kept += [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $command; timeout = 3 }) } }
+        if ($Install) { $kept += [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $command; timeout = $(if ($name -eq 'PermissionRequest') { 130 } else { 3 }) }) } }
         if ($config.hooks.PSObject.Properties[$name]) {
             $config.hooks.$name = $kept
         } elseif ($Install) {
@@ -70,6 +71,39 @@ if ($Install -or $Uninstall) {
     }
     Write-AtomicJson $file $config
     exit 0
+}
+
+function Wait-IslandDecision($event, $id) {
+    $heartbeat = Join-Path $StateRoot 'island-heartbeat'
+    if (-not (Test-Path -LiteralPath (Join-Path $StateRoot 'island-approvals-enabled'))) { return }
+    if (-not (Test-Path -LiteralPath $heartbeat) -or ([DateTime]::UtcNow - (Get-Item -LiteralPath $heartbeat).LastWriteTimeUtc).TotalSeconds -gt 5) { return }
+    $tool = Clip-Text $event.tool_name 120
+    $command = if ($tool -in @('Bash', 'apply_patch')) { [string]$event.tool_input.command } else { $event.tool_input | ConvertTo-Json -Depth 100 }
+    if (-not $command -or $command.Length -gt 32768) { return }
+    $nonce = [guid]::NewGuid().ToString('N')
+    $folder = Join-Path $StateRoot 'requests'
+    [IO.Directory]::CreateDirectory($folder) | Out-Null
+    $request = Join-Path $folder "$id-$nonce.json"
+    $response = Join-Path $folder "$id-$nonce.response"
+    $expires = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [Math]::Min(120, [Math]::Max(1, $ApprovalWaitSeconds)) * 1000
+    try {
+        Write-AtomicJson $request ([ordered]@{ requestId = $nonce; sessionId = $id; turnId = [string]$event.turn_id; tool = $tool; command = $command; expiresAt = $expires })
+        while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $expires) {
+            $current = Get-Content -LiteralPath (Join-Path $StateRoot "$id.json") -Raw | ConvertFrom-Json
+            if ($current.turn_id -ne [string]$event.turn_id -or $current.status -in @('interrupted', 'completed', 'closed')) { return }
+            if (Test-Path -LiteralPath $response) {
+                $answer = Get-Content -LiteralPath $response -Raw | ConvertFrom-Json
+                if ($answer.requestId -eq $nonce -and $answer.decision -in @('allow', 'deny')) {
+                    return [string]$answer.decision
+                }
+            }
+            if (-not (Test-Path -LiteralPath $heartbeat) -or ([DateTime]::UtcNow - (Get-Item -LiteralPath $heartbeat).LastWriteTimeUtc).TotalSeconds -gt 5) { return }
+            Start-Sleep -Milliseconds 100
+        }
+    } finally {
+        if (Test-Path -LiteralPath $request) { [IO.File]::Delete($request) }
+        if (Test-Path -LiteralPath $response) { [IO.File]::Delete($response) }
+    }
 }
 
 # A bounded stdin read keeps a broken producer from exhausting memory.
@@ -145,6 +179,32 @@ try {
     } finally {
         if ($acquired) { $mutex.ReleaseMutex() }
         $mutex.Dispose()
+    }
+    if ($name -eq 'PermissionRequest') {
+        $decision = Wait-IslandDecision $event $id
+        if ($decision) {
+            $responseMutex = New-Object Threading.Mutex($false, "Local\BloomCodex-$id")
+            $responseAcquired = $false
+            try {
+                try { $responseAcquired = $responseMutex.WaitOne(1000) } catch [Threading.AbandonedMutexException] { $responseAcquired = $true }
+                if ($responseAcquired) {
+                    $current = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+                    if ($current.turn_id -ne $turn -or $current.status -in @('interrupted', 'completed', 'closed')) { exit 0 }
+                    if ($decision -eq 'deny') {
+                        $removed = $false
+                        $current.pending_keys = @($current.pending_keys | Where-Object { if (-not $removed -and $_ -eq $key) { $removed = $true; $false } else { $true } })
+                        $current.status = if ($current.pending_keys.Count) { 'awaiting_approval' } else { 'running' }
+                    }
+                    $current.detail = if ($decision -eq 'deny') { 'Permission denied' } else { 'Permission allowed once' }
+                    $current.updated_at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                    Write-AtomicJson $file $current
+                } else { exit 0 }
+            } finally {
+                if ($responseAcquired) { $responseMutex.ReleaseMutex() }
+                $responseMutex.Dispose()
+            }
+            @{ hookSpecificOutput = @{ hookEventName = 'PermissionRequest'; decision = @{ behavior = $decision } } } | ConvertTo-Json -Depth 5 -Compress
+        }
     }
 } catch {
     # Status reporting must never block or approve a Codex action.

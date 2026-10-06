@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import {
 	Check,
 	ChevronRight,
 	ExternalLink,
 	LoaderCircle,
+	SendHorizontal,
 	ShieldAlert,
 	Sparkles,
 	X
@@ -38,6 +39,7 @@ export function AntigravityIsland({
 	loading,
 	error,
 	refresh,
+	sendPrompt,
 	close
 }: {
 	expanded: boolean;
@@ -50,14 +52,31 @@ export function AntigravityIsland({
 	loading: boolean;
 	error: string;
 	refresh: () => Promise<void>;
+	sendPrompt: (
+		prompt: string,
+		sessionId?: string | null,
+		workspacePath?: string | null,
+		source?: string | null
+	) => Promise<string>;
 	close: () => void;
 }) {
 	const [busy, setBusy] = useState(false);
 	const [actionError, setActionError] = useState("");
+	const [promptInput, setPromptInput] = useState("");
+	const [isSendingPrompt, setIsSendingPrompt] = useState(false);
+	const [promptSuccess, setPromptSuccess] = useState("");
+	const inputRef = useRef<HTMLInputElement>(null);
 
 	const running = sessions.filter((s) => s.status === "running").length;
 	const approvals = sessions.filter((s) => s.status === "awaiting_approval");
 	const pending = selected?.status === "awaiting_approval";
+
+	useEffect(() => {
+		if (promptSuccess) {
+			const timer = setTimeout(() => setPromptSuccess(""), 3000);
+			return () => clearTimeout(timer);
+		}
+	}, [promptSuccess]);
 
 	const open = async () => {
 		if (busy) return;
@@ -72,6 +91,48 @@ export function AntigravityIsland({
 			setActionError(String(e));
 		} finally {
 			setBusy(false);
+		}
+	};
+
+	const handleSendPrompt = async () => {
+		const text = promptInput.trim();
+		if (!text || isSendingPrompt) return;
+		setIsSendingPrompt(true);
+		setActionError("");
+		try {
+			await sendPrompt(
+				text,
+				selected?.id,
+				selected?.workspacePath,
+				selected?.source
+			);
+			setPromptInput("");
+			setPromptSuccess("Prompt sent!");
+		} catch (e) {
+			setActionError(String(e));
+		} finally {
+			setIsSendingPrompt(false);
+		}
+	};
+
+	const handleQuickAllow = async () => {
+		setIsSendingPrompt(true);
+		setActionError("");
+		try {
+			// First try focusing
+			await open();
+			// Also send "Yes" confirmation
+			await sendPrompt(
+				"Proceed / Yes",
+				selected?.id,
+				selected?.workspacePath,
+				selected?.source
+			);
+			setPromptSuccess("Approved!");
+		} catch (e) {
+			setActionError(String(e));
+		} finally {
+			setIsSendingPrompt(false);
 		}
 	};
 
@@ -183,26 +244,85 @@ export function AntigravityIsland({
 						</p>
 						<div className="antigravity-detail-footer">
 							<span title={selected.project}>{selected.project || "Workspace"}</span>
-							<button
-								onClick={() => {
-									void open();
-								}}
-								disabled={busy}
-								className={
-									pending
-										? "antigravity-approval-button"
-										: "antigravity-open-button"
-								}
-							>
-								{busy
-									? "Focusing…"
-									: pending
-										? "Review in Antigravity"
-										: "Open Antigravity"}
-								<ExternalLink size={12} />
-							</button>
+							{pending ? (
+								<div className="antigravity-action-group">
+									<button
+										onClick={() => {
+											void handleQuickAllow();
+										}}
+										disabled={busy || isSendingPrompt}
+										className="antigravity-approval-button"
+										title="Quick Allow & resume"
+									>
+										Quick Allow
+									</button>
+									<button
+										onClick={() => {
+											void open();
+										}}
+										disabled={busy}
+										className="antigravity-open-button"
+									>
+										Review <ExternalLink size={11} />
+									</button>
+								</div>
+							) : (
+								<button
+									onClick={() => {
+										void open();
+									}}
+									disabled={busy}
+									className="antigravity-open-button"
+								>
+									{busy ? "Focusing…" : "Open Chat"}
+									<ExternalLink size={12} />
+								</button>
+							)}
 						</div>
 					</div>
+
+					{/* Quick Prompt Bar: Send Chat Directly into Antigravity! */}
+					<div className="antigravity-prompt-bar">
+						<input
+							ref={inputRef}
+							type="text"
+							className="antigravity-prompt-input"
+							placeholder={
+								selected
+									? `Message Antigravity in ${selected.project}...`
+									: "Ask Antigravity... (Enter to send)"
+							}
+							value={promptInput}
+							onChange={(e) => setPromptInput(e.target.value)}
+							onKeyDown={(e) => {
+								if (e.key === "Enter" && !e.shiftKey) {
+									e.preventDefault();
+									void handleSendPrompt();
+								}
+							}}
+							disabled={isSendingPrompt}
+						/>
+						<button
+							className="antigravity-send-button"
+							onClick={() => {
+								void handleSendPrompt();
+							}}
+							disabled={!promptInput.trim() || isSendingPrompt}
+							aria-label="Send prompt to Antigravity"
+							title="Send prompt to Antigravity"
+						>
+							{isSendingPrompt ? (
+								<LoaderCircle size={14} className="antigravity-spinner" />
+							) : (
+								<SendHorizontal size={14} />
+							)}
+						</button>
+					</div>
+					{promptSuccess && (
+						<div className="antigravity-prompt-feedback" role="status">
+							<Check size={12} /> {promptSuccess}
+						</div>
+					)}
 				</>
 			) : (
 				<div className="antigravity-empty">

@@ -1,9 +1,9 @@
-//! Local lifecycle-hook status. No chat content, credentials, or approval decisions.
-use serde::Serialize;
+//! Local status and explicitly requested, one-time island approval responses.
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,7 +19,7 @@ const HOOK_EVENTS: [&str; 8] = [
     "Interrupt",
 ];
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSession {
     id: String,
@@ -28,9 +28,21 @@ pub struct CodexSession {
     status: String,
     detail: String,
     updated_at: u64,
+    approval: Option<CodexApproval>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexApproval {
+    request_id: String,
+    session_id: String,
+    turn_id: String,
+    tool: String,
+    command: String,
+    expires_at: u64,
+}
+
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSnapshot {
     installed: bool,
@@ -149,7 +161,7 @@ fn parse_session(row: &Value, titles: &HashMap<String, String>, now: u64) -> Opt
     };
     let mut detail = clipped(row["detail"].as_str().unwrap_or(""), 240);
     // Hooks don't heartbeat; never assert that an old process is still running.
-    if matches!(status, "running" | "awaiting_approval") && age > 15 * 60 * 1000 {
+    if status == "running" && age > 15 * 60 * 1000 {
         status = "unknown";
         detail = "No recent signal. Open Codex to check this chat.".into();
     }
@@ -180,6 +192,7 @@ fn parse_session(row: &Value, titles: &HashMap<String, String>, now: u64) -> Opt
         status: status.into(),
         detail,
         updated_at,
+        approval: None,
     })
 }
 
@@ -239,10 +252,168 @@ fn read_snapshot() -> Result<CodexSnapshot, String> {
             .then(b.updated_at.cmp(&a.updated_at))
     });
     sessions.truncate(24);
+    for session in &mut sessions {
+        if matches!(session.status.as_str(), "running" | "awaiting_approval") {
+            session.approval = active_approvals(&root, &session.id, now).into_iter().next();
+            if session.approval.is_some() {
+                session.status = "awaiting_approval".into();
+            }
+        }
+    }
     Ok(CodexSnapshot {
         installed,
         sessions,
     })
+}
+
+fn active_approvals(root: &std::path::Path, id: &str, now: u64) -> Vec<CodexApproval> {
+    let mut approvals = Vec::new();
+    let Ok(entries) = fs::read_dir(root.join("requests")) else {
+        return approvals;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("json")
+            || !entry.file_type().is_ok_and(|v| v.is_file())
+        {
+            continue;
+        }
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file.take(64 * 1024 + 1).read_to_end(&mut bytes).is_err() || bytes.len() > 64 * 1024 {
+            continue;
+        }
+        if let Ok(request) = serde_json::from_slice::<CodexApproval>(&bytes) {
+            if request.expires_at <= now
+                && valid_id(&request.session_id)
+                && request.request_id.len() == 32
+                && request.request_id.bytes().all(|c| c.is_ascii_hexdigit())
+                && path.file_name().and_then(|v| v.to_str())
+                    == Some(format!("{}-{}.json", request.session_id, request.request_id).as_str())
+            {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(path.with_extension("response"));
+                continue;
+            }
+            if request.session_id == id
+                && valid_request(&request, now)
+                && !path.with_extension("response").exists()
+            {
+                approvals.push(request);
+            }
+        }
+    }
+    approvals.sort_by_key(|r| r.expires_at);
+    approvals
+}
+
+fn valid_request(request: &CodexApproval, now: u64) -> bool {
+    valid_id(&request.session_id)
+        && request.request_id.len() == 32
+        && request.request_id.bytes().all(|c| c.is_ascii_hexdigit())
+        && !request.command.is_empty()
+        && request.command.len() <= 32768
+        && request.expires_at > now
+        && request.expires_at <= now.saturating_add(130_000)
+}
+
+#[tauri::command]
+pub fn respond_codex_approval(
+    id: String,
+    request_id: String,
+    decision: String,
+) -> Result<(), String> {
+    if !valid_id(&id)
+        || request_id.len() != 32
+        || !request_id.bytes().all(|c| c.is_ascii_hexdigit())
+        || !matches!(decision.as_str(), "allow" | "deny")
+    {
+        return Err("Invalid approval response.".into());
+    }
+    let root = state_root()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let request = active_approvals(&root, &id, now)
+        .into_iter()
+        .find(|r| r.request_id == request_id)
+        .ok_or("This request has expired. Review it in Codex.")?;
+    let state: Value = serde_json::from_slice(
+        &fs::read(root.join(format!("{id}.json"))).map_err(|_| "Chat is no longer available.")?,
+    )
+    .map_err(|_| "Chat is no longer available.")?;
+    if state["status"] != "awaiting_approval" || state["turn_id"].as_str() != Some(&request.turn_id)
+    {
+        return Err("This request is no longer active.".into());
+    }
+    // Create once: repeated clicks cannot overwrite an earlier decision.
+    let response = root
+        .join("requests")
+        .join(format!("{id}-{request_id}.response"));
+    let temporary = response.with_extension("response.tmp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| "A response was already sent or the request expired.")?;
+    let result = (|| {
+        file.write_all(
+            serde_json::json!({"requestId": request_id, "decision": decision})
+                .to_string()
+                .as_bytes(),
+        )
+        .map_err(|_| "Cannot send the approval response.".to_string())?;
+        file.sync_all()
+            .map_err(|_| "Cannot save the approval response.".to_string())?;
+        drop(file);
+        fs::hard_link(&temporary, &response)
+            .map_err(|_| "A response was already sent or the request expired.".to_string())
+    })();
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+pub fn start_status_service(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    std::thread::spawn(move || {
+        let mut previous = String::new();
+        loop {
+            if crate::state::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if let Ok(root) = state_root() {
+                if crate::utils::get_setting_str(&app, "bloom-codex-enabled").as_deref()
+                    != Some("false")
+                {
+                    let _ = fs::create_dir_all(&root);
+                    let _ = fs::write(root.join("island-heartbeat"), b"active");
+                } else {
+                    let _ = fs::remove_file(root.join("island-heartbeat"));
+                }
+            }
+            if let Ok(root) = state_root() {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let _ = active_approvals(&root, "", now);
+            }
+            if let Ok(snapshot) = read_snapshot() {
+                let serialized = serde_json::to_string(&snapshot).unwrap_or_default();
+                if serialized != previous {
+                    previous = serialized;
+                    let _ = app.emit("codex-update", snapshot);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if let Ok(root) = state_root() {
+            let _ = fs::remove_file(root.join("island-heartbeat"));
+        }
+    });
 }
 
 #[tauri::command]
@@ -277,7 +448,96 @@ fn configure_bridge(install: bool) -> Result<(), String> {
     if !output.status.success() {
         return Err("Cannot update Codex hooks. Check hooks.json is valid and writable; existing hooks were preserved.".into());
     }
+    if install {
+        fs::write(root.join("island-approvals-enabled"), b"enabled")
+            .map_err(|_| "Cannot enable island approvals.")?;
+    } else {
+        let _ = fs::remove_file(root.join("island-approvals-enabled"));
+    }
     Ok(())
+}
+
+fn read_rate_limits() -> Result<Value, String> {
+    use std::os::windows::process::CommandExt;
+    let cli = if let Some(path) = std::env::var_os("CODEX_CLI_PATH") {
+        PathBuf::from(path)
+    } else {
+        let output = std::process::Command::new("powershell.exe").args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "(Get-AppxPackage -Name OpenAI.Codex | Select-Object -First 1 -ExpandProperty InstallLocation)"]).creation_flags(0x08000000).output().map_err(|_| "Cannot find Codex.")?;
+        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+            .join("app")
+            .join("resources")
+            .join("codex.exe")
+    };
+    if !cli.is_file() {
+        return Err("Codex desktop is required to read usage limits.".into());
+    }
+    let mut child = std::process::Command::new(cli)
+        .args(["app-server", "--stdio"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x08000000)
+        .spawn()
+        .map_err(|_| "Cannot read Codex usage.")?;
+    let stdout = child.stdout.take().ok_or("Cannot read Codex usage.")?;
+    let mut stdin = child.stdin.take().ok_or("Cannot read Codex usage.")?;
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut bytes = Vec::new();
+            if reader
+                .by_ref()
+                .take(1024 * 1024)
+                .read_until(b'\n', &mut bytes)
+                .unwrap_or(0)
+                == 0
+                || bytes.len() >= 1024 * 1024
+            {
+                break;
+            }
+            if let Ok(row) = serde_json::from_slice::<Value>(&bytes) {
+                if send.send(row).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let result = (|| {
+        writeln!(stdin, "{}", serde_json::json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"bloom_usage","version":"1.0"}}})).map_err(|_| "Cannot read Codex usage.")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let row = receive
+                .recv_timeout(remaining)
+                .map_err(|_| "Codex usage request timed out.")?;
+            if row["id"] == 1 {
+                if row.get("error").is_some() {
+                    return Err("Cannot initialize Codex usage reader.".into());
+                }
+                writeln!(stdin, "{{\"method\":\"initialized\"}}")
+                    .map_err(|_| "Cannot read Codex usage.")?;
+                writeln!(stdin, "{{\"id\":2,\"method\":\"account/rateLimits/read\"}}")
+                    .map_err(|_| "Cannot read Codex usage.")?;
+            } else if row["id"] == 2 {
+                if let Some(value) = row.get("result") {
+                    return Ok(value.clone());
+                }
+                return Err("Usage unavailable. Check your Codex sign-in.".into());
+            }
+        }
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[tauri::command]
+pub async fn get_codex_rate_limits() -> Result<Value, String> {
+    // Account-wide limits only; no model turns or account mutations.
+    tauri::async_runtime::spawn_blocking(read_rate_limits)
+        .await
+        .map_err(|_| "Cannot read Codex usage.".to_string())?
 }
 
 #[tauri::command]
@@ -304,12 +564,45 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn stale_approval_is_not_presented_as_live() {
-        let row = json!({"schema":1,"session_id":"chat-123","status":"awaiting_approval","updated_at":1000,"cwd":"C:\\repo\\bloom","detail":"Approval requested"});
+    fn approval_requires_an_exact_fresh_request() {
+        let mut request = CodexApproval {
+            request_id: "a".repeat(32),
+            session_id: "chat-1".into(),
+            turn_id: "turn-1".into(),
+            tool: "Bash".into(),
+            command: "echo review-me".into(),
+            expires_at: 121_000,
+        };
+        assert!(valid_request(&request, 1000));
+        assert!(!valid_request(&request, 121_000));
+        request.expires_at = 132_000;
+        assert!(!valid_request(&request, 1000));
+        request.expires_at = 2000;
+        request.request_id = "../escape".into();
+        assert!(!valid_request(&request, 1000));
+        request.request_id = "b".repeat(32);
+        request.command.clear();
+        assert!(!valid_request(&request, 1000));
+    }
+
+    #[test]
+    fn stale_running_is_not_presented_as_live() {
+        let row = json!({"schema":1,"session_id":"chat-123","status":"running","updated_at":1000,"cwd":"C:\\repo\\bloom","detail":"Working"});
         let session = parse_session(&row, &HashMap::new(), 901_001).unwrap();
         assert_eq!(session.status, "unknown");
         assert_eq!(session.project, "bloom");
         assert!(!session.detail.contains("Approval"));
+    }
+
+    #[test]
+    fn permission_attention_remains_until_a_resolution_event() {
+        let row = json!({"schema":1,"session_id":"chat-123","status":"awaiting_approval","updated_at":1000,"detail":"Approval requested"});
+        assert_eq!(
+            parse_session(&row, &HashMap::new(), 901_001)
+                .unwrap()
+                .status,
+            "awaiting_approval"
+        );
     }
 
     #[test]

@@ -76,7 +76,7 @@ button to jump directly to the session.
 | --- | --- | --- | --- |
 | `bloom-codex-enabled` | `"true"` / `"false"` | `"true"` | Show the Codex notch mode and reveal local task/approval activity. Connect separately in Notch settings. |
 
-The Connect button adds informational lifecycle hooks to `%CODEX_HOME%/hooks.json`
+The Connect button adds lifecycle and interactive permission hooks to `%CODEX_HOME%/hooks.json`
 (default `%USERPROFILE%/.codex/hooks.json`), preserving existing hooks and saving a
 backup. Review/trust the new hooks in Codex and start or resume a local chat.
 Disconnect removes only Bloom's hooks. Turning the display off hides the mode;
@@ -84,14 +84,31 @@ Disconnect also stops status reporting. Local Work is supported where lifecycle
 hooks are available; cloud chats are not monitored.
 
 Status files in `%APPDATA%/bloom/codex/` contain session IDs, project paths, tool
-names, approval descriptions and timestamps. Prompts, tool arguments, responses,
-and credentials are not copied. Recent titles are read best-effort from Codex's
+names, approval descriptions and timestamps. Prompts, tool results and credentials
+are not copied. Tool arguments are stored transiently for an interactive permission
+request so the user can review the exact action. Recent titles are read best-effort from Codex's
 local session index, with a project/ID fallback. Hooks do not heartbeat: after
-15 minutes without an event, active states show "No recent signal". Finished
+15 minutes without an event, running states show "No recent signal". Pending
+approval attention remains until a resolution event. Finished
 sessions remain selectable for seven days (up to 24 recent sessions).
 
-An approval request reveals the Codex mode and offers **Review in Codex**. The
-island never returns approval decisions. Scroll over other notch modes to reach
+An approval request reveals the Codex mode and keeps it expanded and visible until
+the request is resolved, even in smart/peek mode. Live island requests show the exact
+command or tool arguments and offer **Allow once** and **Deny**. Responses are paired
+with a random request ID and the current turn; expired requests cannot be approved.
+The hook waits up to 120 seconds while Bloom is alive, then falls back to Codex's
+normal approval prompt. Turning the island off or closing Bloom also falls back.
+Pending commands are stored only while waiting and removed afterward. Approval
+responses never create an allow rule or change Codex's sandbox settings.
+
+Account-wide usage is read through the installed Codex app-server's
+`account/rateLimits/read` endpoint once per minute. The panel shows each returned
+quota window's remaining percentage and reset time; unavailable limits are shown
+as unavailable. No model task is started and no credit reset is consumed.
+
+Running-to-completed transitions reveal the Codex mode for six seconds, even when
+another notch mode was selected. Older/native requests offer **Review in Codex**. The
+island returns a decision only for an explicit Allow once/Deny click. Scroll over other notch modes to reach
 Codex; scroll inside the Codex panel to browse chats. Close the panel to return
 to status.
 
